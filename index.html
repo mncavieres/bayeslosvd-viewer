@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BAYES-LOSVD Viewer</title>
+<meta name="description" content="Interactive viewer for BAYES-LOSVD results: kinematic maps, LOSVDs and spectral fits, read from HDF5 directly in the browser.">
+<link rel="icon" href="assets/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/css/app.css">
+<script>
+  try {
+    const t = localStorage.getItem("bayeslosvd-viewer-theme");
+    if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+  } catch (e) {}
+</script>
+<script type="module" src="assets/js/main.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+      <rect x="1" y="1" width="30" height="30" rx="7" fill="var(--accent)"/>
+      <path d="M5 23 C10 23 11 8 16 8 C21 8 22 23 27 23" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/>
+      <path d="M5 26 H27" stroke="#ffffff99" stroke-width="1.4" stroke-linecap="round"/>
+    </svg>
+    <div>
+      <h1>BAYES-LOSVD<span class="h1-suffix"> Viewer</span></h1>
+      <div class="tagline">Kinematic maps, LOSVDs and spectral fits</div>
+    </div>
+  </div>
+  <div class="topbar-actions">
+    <button type="button" class="btn primary" id="openBtn">Open files</button>
+    <input type="file" id="fileInput" multiple hidden accept=".h5,.hdf5,.hdf,.he5,.json,.csv,.txt,.dat,.html,.htm">
+    <div class="menu" id="exportMenu">
+      <button type="button" class="btn" id="exportBtn" aria-haspopup="true" aria-expanded="false">Export</button>
+      <div class="menu-list" hidden>
+        <button type="button" data-export="png">Map as PNG</button>
+        <button type="button" data-export="csv">Active result as CSV</button>
+        <button type="button" data-export="bundle">Session bundle (JSON)</button>
+      </div>
+    </div>
+    <button type="button" class="btn icon" id="themeBtn" aria-label="Theme">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9A9 9 0 0 0 12 3zm0 16V5a7 7 0 0 1 0 14z" fill="currentColor"/></svg>
+    </button>
+    <a class="btn icon" id="repoLink" href="#" target="_blank" rel="noopener" aria-label="Source code on GitHub" title="Source code on GitHub">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a10 10 0 0 0-3.16 19.49c.5.09.68-.22.68-.48v-1.7c-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.61.07-.61 1 .07 1.53 1.03 1.53 1.03.9 1.52 2.34 1.08 2.91.83.09-.65.35-1.08.63-1.33-2.22-.25-4.55-1.11-4.55-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.02a9.6 9.6 0 0 1 5 0c1.91-1.29 2.75-1.02 2.75-1.02.55 1.38.2 2.4.1 2.65.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.68-4.57 4.93.36.31.68.92.68 1.85v2.74c0 .27.18.58.69.48A10 10 0 0 0 12 2z"/></svg>
+    </a>
+  </div>
+</header>
+
+<div class="status-bar" id="statusBar" role="status" aria-live="polite" hidden>
+  <span id="statusText"></span>
+  <div class="progress" hidden><div id="progressFill"></div></div>
+</div>
+
+<section class="welcome" id="welcome">
+  <div class="dropzone" id="dropzone">
+    <h2>Open BAYES-LOSVD results</h2>
+    <p>Drop one or more <code>*_results.hdf5</code> files anywhere on this page. Files are read locally in your browser; nothing is uploaded.</p>
+    <div class="welcome-actions">
+      <button type="button" class="btn primary large" id="welcomeOpenBtn">Choose files</button>
+      <button type="button" class="btn large" id="demoBtn">Load demo data</button>
+    </div>
+    <dl class="formats">
+      <dt>.hdf5 / .h5</dt>
+      <dd>BAYES-LOSVD results (output of <code>bayes_losvd_run.py</code>): moment maps, LOSVDs with credible bands, and spectral fits.</dd>
+      <dt>.json</dt>
+      <dd>Session bundles exported from this viewer, or the data payload of a legacy dashboard.</dd>
+      <dt>.html</dt>
+      <dd>Self-contained dashboards made by <code>build_kinematics_dashboard.py</code>.</dd>
+      <dt>.csv</dt>
+      <dd>Bin tables (<code>x</code>, <code>y</code> and any columns to map), or MGE tables (<code>sigma_arcsec</code>, <code>q_obs</code>, luminosity) for contour overlays.</dd>
+    </dl>
+  </div>
+</section>
+
+<div class="workspace" id="workspace" hidden>
+  <aside class="sidebar">
+    <section class="card">
+      <div class="card-head">
+        <h2>Results</h2>
+        <button type="button" class="btn small" id="addMoreBtn">Add</button>
+      </div>
+      <ul class="result-list" id="resultList"></ul>
+      <label class="field">
+        <span class="field-label">Compare with</span>
+        <select id="compareSelect"></select>
+      </label>
+      <p class="hint" id="compareHint"></p>
+    </section>
+
+    <section class="card">
+      <h2>Map</h2>
+      <div class="field">
+        <span class="field-label">Quantity</span>
+        <div id="quantityButtons" class="quantity-buttons"></div>
+      </div>
+      <div class="field">
+        <span class="field-label">Display</span>
+        <div class="segmented" id="viewButtons">
+          <button type="button" data-view="spaxels" title="Colour every spaxel by the value of its bin">Spaxels</button>
+          <button type="button" data-view="bins" title="One marker per bin centre">Bins</button>
+          <button type="button" data-view="interp" title="Linear interpolation between bin centres">Interpolated</button>
+        </div>
+      </div>
+      <div class="field row">
+        <label class="grow">
+          <span class="field-label">Colormap</span>
+          <select id="cmapSelect"></select>
+        </label>
+        <label class="check"><input type="checkbox" id="cmapReverse"> Reverse</label>
+      </div>
+      <div class="field">
+        <span class="field-label">Color limits</span>
+        <div class="limits">
+          <input id="vminInput" type="number" step="any" aria-label="Color scale minimum">
+          <span class="muted">to</span>
+          <input id="vmaxInput" type="number" step="any" aria-label="Color scale maximum">
+        </div>
+        <div class="segmented small" id="limitButtons">
+          <button type="button" data-mode="robust">2–98%</button>
+          <button type="button" data-mode="minmax">Min–max</button>
+          <button type="button" data-mode="symmetric">± Symmetric</button>
+        </div>
+      </div>
+      <label class="field">
+        <span class="field-label">Rotate map (degrees, counter-clockwise)</span>
+        <input type="number" id="rotationInput" step="any" value="0">
+      </label>
+    </section>
+
+    <section class="card">
+      <h2>Masking</h2>
+      <label class="check"><input type="checkbox" id="maskSigma"> Hide σ outliers</label>
+      <p class="hint" id="maskHint">Hides bins whose σ exceeds the largest σ within
+        <input class="inline-num" id="maskRadius" type="number" step="0.1" min="0" value="1" aria-label="Central radius in arcsec"> arcsec of the centre.</p>
+      <label class="field">
+        <span class="field-label">Minimum S/N</span>
+        <input type="number" id="minSnr" step="any" placeholder="no cut">
+      </label>
+    </section>
+
+    <section class="card">
+      <h2>Overlays</h2>
+      <label class="check"><input type="checkbox" id="showIsophotes"> Flux isophotes (0.5 mag steps)</label>
+      <label class="check"><input type="checkbox" id="showCenters"> Bin centres</label>
+      <label class="check"><input type="checkbox" id="showMge" disabled> MGE contours</label>
+      <div class="mge-row">
+        <button type="button" class="btn small" id="mgeLoadBtn">Load MGE table</button>
+        <input type="file" id="mgeInput" hidden accept=".csv,.txt,.dat">
+        <label class="inline">PA <input type="number" id="mgePa" step="any" value="0" aria-label="MGE major axis angle in degrees"> °</label>
+      </div>
+      <p class="hint" id="mgeStatus"></p>
+    </section>
+  </aside>
+
+  <main class="content">
+    <section class="panel map-panel">
+      <div class="panel-head">
+        <div>
+          <h2 id="mapTitle">Map</h2>
+          <div class="panel-sub" id="mapSubtitle"></div>
+        </div>
+        <div class="panel-tools">
+          <div class="segmented small">
+            <button type="button" id="zoomInBtn" aria-label="Zoom in">+</button>
+            <button type="button" id="zoomOutBtn" aria-label="Zoom out">−</button>
+            <button type="button" id="zoomResetBtn">Reset</button>
+          </div>
+        </div>
+      </div>
+      <div class="map-shell">
+        <div class="map-wrap">
+          <canvas id="mapCanvas" aria-label="Kinematic map. Click a bin to inspect it; scroll to zoom; drag to pan."></canvas>
+          <div class="tooltip" id="mapTooltip" hidden></div>
+        </div>
+        <canvas id="colorbarCanvas" aria-hidden="true"></canvas>
+      </div>
+      <div class="map-status" id="mapStatus"></div>
+    </section>
+
+    <div class="side-col">
+      <section class="panel bin-panel">
+        <div class="panel-head">
+          <h2>Selected bins</h2>
+          <div class="bin-input">
+            <input id="binInput" type="number" min="0" step="1" placeholder="Bin #" aria-label="Bin number">
+            <button type="button" class="btn small" id="addBinBtn">Add</button>
+            <button type="button" class="btn small ghost" id="clearBinsBtn">Clear</button>
+          </div>
+        </div>
+        <div class="chips" id="binChips"></div>
+        <div class="metrics" id="metrics"></div>
+      </section>
+
+      <section class="panel losvd-panel">
+        <div class="panel-head">
+          <h2>LOSVD</h2>
+          <label class="check small"><input type="checkbox" id="losvdAll"> Same bin in all results</label>
+        </div>
+        <canvas id="losvdCanvas"></canvas>
+        <div class="legend" id="losvdLegend"></div>
+        <p class="hint" id="losvdHint"></p>
+      </section>
+    </div>
+
+    <section class="panel spectrum-panel">
+      <div class="panel-head">
+        <h2>Spectral fit</h2>
+        <div class="panel-tools">
+          <span class="muted" id="spectrumStatus"></span>
+          <button type="button" class="btn small" id="specResetBtn">Reset zoom</button>
+        </div>
+      </div>
+      <canvas id="spectrumCanvas" aria-label="Observed spectrum, best-fit model and residuals. Scroll to zoom, drag to pan."></canvas>
+      <p class="hint legend-line">
+        <span class="legend-item" style="--swatch: var(--ink)">observed</span>
+        <span class="legend-item" style="--swatch: var(--accent)">best fit (median)</span>
+        <span class="legend-item box" style="--swatch: var(--empty-cell)">not fitted</span>
+      </p>
+    </section>
+
+    <section class="panel info-panel">
+      <details>
+        <summary>Result details</summary>
+        <div id="resultInfoBody"></div>
+      </details>
+    </section>
+  </main>
+</div>
+
+<footer class="footer">
+  A viewer for <a href="https://github.com/jfalconbarroso/BAYES-LOSVD" target="_blank" rel="noopener">BAYES-LOSVD</a>
+  (Falcón-Barroso &amp; Martig 2021, A&amp;A 646, A31). All data stay in your browser.
+</footer>
+
+<div class="drop-overlay" id="dropOverlay" hidden><div>Drop files to load</div></div>
+</body>
+</html>

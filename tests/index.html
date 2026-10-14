@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Viewer Tests</title>
+<style>
+  :root { --bg: #ffffff; --ink: #172026; --ok: #0f766e; --bad: #b4233a; --muted: #5b6870; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #11161a; --ink: #e6ecea; --ok: #2bb3a3; --bad: #f07c8e; --muted: #98a6a4; } }
+  body { font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; background: var(--bg); color: var(--ink); margin: 0; padding: 16px; }
+  h1 { font-size: 18px; }
+  li { font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; }
+  .ok { color: var(--ok); }
+  .bad { color: var(--bad); }
+  #summary { font-weight: 700; }
+  .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<h1>bayeslosvd-viewer tests</h1>
+<p class="muted">Loads the demo HDF5 files through the real worker and compares against <code>reference.json</code> (NumPy / SciPy).</p>
+<p id="summary">Running…</p>
+<ul id="log"></ul>
+<script type="module">
+import {fitGaussHermite, limitsFor, marchingSquares, matchBins, buildSpaxelGrid} from "../assets/js/analysis.js";
+import {Hdf5Client} from "../assets/js/hdf5-client.js";
+import {resultFromHdf5Summary, makeBundle, resultsFromBundle, resultFromTable, mgeFromTable} from "../assets/js/data.js";
+
+const log = document.getElementById("log");
+let passed = 0;
+let failed = 0;
+function check(name, ok, detail = "") {
+  const li = document.createElement("li");
+  li.className = ok ? "ok" : "bad";
+  li.textContent = `${ok ? "PASS" : "FAIL"}  ${name}${detail ? `  (${detail})` : ""}`;
+  log.appendChild(li);
+  if (ok) passed += 1;
+  else failed += 1;
+}
+const close = (a, b, tol) => Math.abs(a - b) <= tol;
+
+async function run() {
+  const reference = await fetch("reference.json").then((r) => r.json());
+  const client = new Hdf5Client();
+  for (const [name, ref] of Object.entries(reference)) {
+    const {id, summary} = await client.open({url: new URL(`../demo/${name}`, location.href).href});
+    const r = resultFromHdf5Summary(summary, {fileId: id, fileName: name});
+    check(`${name}: nbins`, r.nbins === ref.nbins, `${r.nbins}`);
+    for (const row of ref.bins) {
+      const b = row.bin;
+      for (const k of ["vel", "sigma"]) {
+        const v = r.quantities.get(k)[b];
+        check(`${name} bin ${b} ${k}`, close(v, row[k], 1e-6), `${v.toFixed(6)} vs ${row[k].toFixed(6)}`);
+      }
+      for (const k of ["skew", "kurt"]) {
+        const v = r.quantities.get(k)[b];
+        check(`${name} bin ${b} ${k}`, close(v, row[k], 1e-8), `${v.toFixed(8)} vs ${row[k].toFixed(8)}`);
+      }
+      const gh = fitGaussHermite(r.xvel, r.losvd, (b * r.rows + r.medianRow) * r.nvel);
+      check(`${name} bin ${b} GH V/σ`, close(gh.vel, row.gh.vel, 0.05) && close(gh.sigma, row.gh.sigma, 0.05),
+        `${gh.vel.toFixed(3)}/${gh.sigma.toFixed(3)} vs ${row.gh.vel.toFixed(3)}/${row.gh.sigma.toFixed(3)}`);
+      check(`${name} bin ${b} GH h3/h4`, close(gh.h3, row.gh.h3, 1e-3) && close(gh.h4, row.gh.h4, 1e-3),
+        `${gh.h3.toFixed(4)}/${gh.h4.toFixed(4)} vs ${row.gh.h3.toFixed(4)}/${row.gh.h4.toFixed(4)}`);
+    }
+    if (r.spectra) {
+      const spec = await client.spectrum(id, 3);
+      check(`${name}: spectrum shapes`, spec.obs.length === spec.wave.length && spec.bestfit.length === 5 * spec.wave.length,
+        `${spec.wave.length} pixels`);
+      check(`${name}: wavelength converted from ln(λ)`, spec.wave[0] > 8000 && spec.wave[0] < 9000, `${spec.wave[0].toFixed(1)} Å`);
+    }
+    // Bundle round trip
+    const bundle = JSON.parse(JSON.stringify(makeBundle([r], {settings: {rotation: -25}, mge: null})));
+    const back = resultsFromBundle(bundle, "bundle.json").results[0];
+    let maxDiff = 0;
+    for (let b = 0; b < r.nbins; b += 1) maxDiff = Math.max(maxDiff, Math.abs(back.quantities.get("vel")[b] - r.quantities.get("vel")[b]));
+    check(`${name}: bundle round trip (V)`, maxDiff < 1e-3, `max |ΔV| = ${maxDiff.toExponential(2)} km/s`);
+    check(`${name}: bundle keeps spaxel lattice`, back.grid && back.grid.nx === r.grid.nx && back.grid.ny === r.grid.ny);
+  }
+
+  // Pure helpers
+  const lims = limitsFor(Float64Array.from([-5, -1, 0, 2, 100]), "minmax");
+  check("limitsFor minmax", lims[0] === -5 && lims[1] === 100);
+  const sym = limitsFor(Float64Array.from({length: 101}, (_, i) => i - 50), "symmetric");
+  check("limitsFor symmetric", close(sym[0], -sym[1], 1e-12) && sym[1] > 0);
+  const grid = {nx: 3, ny: 3, x0: 0, y0: 0, dx: 1, dy: 1};
+  const segs = marchingSquares(grid, Float64Array.from([0, 0, 0, 0, 1, 0, 0, 0, 0]), [0.5]);
+  check("marching squares closes a ring", segs.length === 1 && segs[0].segments.length === 16, `${segs[0]?.segments.length / 4} segments`);
+  const m = matchBins({x: [0, 1, 2], y: [0, 0, 0]}, {x: [2.01, 0, 5], y: [0, 0.01, 0]}, 0.1);
+  check("matchBins", m[0] === 1 && m[1] === -1 && m[2] === 0, Array.from(m).join(","));
+  const g = buildSpaxelGrid(Float64Array.from([0, 0.2, 0, 0.2]), Float64Array.from([0, 0, 0.2, 0.2]), [0, 0, 1, 1], null);
+  check("spaxel lattice", g.nx === 2 && g.ny === 2 && g.bin[3] === 1 && close(g.dx, 0.2, 1e-9));
+  const t = resultFromTable("x,y,vel,sigma,my_col\n0,0,10,200,1\n1,0,20,190,2\n", "table.csv");
+  check("CSV table import", t.quantities.get("vel")[1] === 20 && t.quantities.has("col:my_col"));
+  const mge = mgeFromTable("sigma_arcsec,q_obs,total_flux\n0.5,0.8,10\n2,0.6,20\n", "mge.csv");
+  check("MGE table import", mge.gaussians.length === 2 && mge.gaussians[1].lum === 20);
+
+  const summary = document.getElementById("summary");
+  summary.textContent = `${passed} passed, ${failed} failed`;
+  summary.className = failed ? "bad" : "ok";
+  document.title = failed ? `FAIL (${failed})` : `PASS (${passed})`;
+}
+
+run().catch((error) => {
+  check("test run", false, error.message);
+  document.getElementById("summary").textContent = `Error: ${error.message}`;
+});
+</script>
+</body>
+</html>
