@@ -1,6 +1,6 @@
 import {
   fitGaussHermite, interpolateBins, limitsFor, magnitudeLevels, marchingSquares, matchBins, mgeModelGrid,
-  rotatePoint, rotationTrig, gridCorners
+  gridCorners
 } from "./analysis.js";
 import {COLORMAP_NAMES, getLut, lutIndex} from "./colormaps.js";
 import {
@@ -8,15 +8,25 @@ import {
   resultFromHdf5Summary, resultFromTable, resultToCsv, resultsFromBundle, resultsFromLegacyPayload
 } from "./data.js";
 import {Hdf5Client} from "./hdf5-client.js";
-import {drawAxes, drawColorbar, formatValue, setupCanvas, theme} from "./plot.js";
+import {apply, describeSkyMatrix, displayMatrix, invert, mul, readFitsWcs, skyMatrix} from "./frames.js";
+import {drawAxes, drawColorbar, formatTick, formatValue, setupCanvas, theme} from "./plot.js";
 
 const REPO_URL = "https://github.com/mncavieres/bayeslosvd-viewer";
+// Sombrero galaxy (M104), JWST/NIRSpec G235H IFU, AGN-subtracted cube: BAYES-LOSVD MAP
+// fits without and with random-walk regularization (slimmed with tools/slim_results.py).
 const DEMO_FILES = [
-  "demo/demo_disk_sampling_results.hdf5",
-  "demo/demo_disk_regularized_results.hdf5"
+  "demo/sombrero_nirspec_g235h_GaussianMAP_results.hdf5",
+  "demo/sombrero_nirspec_g235h_RWregularizedMAP_results.hdf5"
 ];
-const DEMO_MGE = "demo/demo_mge.csv";
-const DEMO_ROTATION = -25; // aligns the synthetic disc's major axis with +x
+const DEMO_MGE = "demo/sombrero_mge.csv";
+const DEMO_SETTINGS = {
+  orientation: "major",
+  galaxyPa: 90, // M104 major axis, degrees East of North
+  dataRotation: -18 // data-frame rotation used by the original dashboards
+};
+
+// "?v=<commit>" on deployed builds; appended to demo data URLs so updates are not hidden by caches
+const VERSION_QUERY = new URL(import.meta.url).search;
 
 const BIN_COLORS = ["#0f766e", "#b6465f", "#2f5aa8", "#c27418", "#6f4aa7", "#54733c", "#8f3b32", "#2f747f"];
 const RESULT_COLORS = ["#2563eb", "#dc2626", "#059669", "#9333ea", "#ea580c", "#0891b2", "#be185d", "#65a30d"];
@@ -82,7 +92,10 @@ const state = {
   limitsMode: null,
   vmin: null,
   vmax: null,
-  rotation: 0,
+  orientation: "data", // data | sky | major
+  dataRotation: 0, // extra rotation (deg, CCW) in the data orientation
+  galaxyPa: NaN, // galaxy major-axis PA (deg East of North)
+  majorFlip: false, // major-axis orientation: put the other end of the axis on +x
   maskSigma: false,
   maskRadius: 1.0,
   minSnr: NaN,
@@ -107,7 +120,7 @@ const el = {};
   "openBtn", "fileInput", "exportBtn", "exportMenu", "themeBtn", "repoLink", "statusBar", "statusText", "progressFill",
   "welcome", "dropzone", "welcomeOpenBtn", "demoBtn", "workspace", "resultList", "compareSelect", "compareHint",
   "quantityButtons", "viewButtons", "cmapSelect", "cmapReverse", "vminInput", "vmaxInput", "limitButtons",
-  "rotationInput", "maskSigma", "maskRadius", "minSnr", "maskHint", "showIsophotes", "showCenters", "showMge",
+  "rotationInput", "orientationButtons", "galaxyPa", "majorFlip", "wcsStatus", "wcsLoadBtn", "wcsInput", "wcsClearBtn", "maskSigma", "maskRadius", "minSnr", "maskHint", "showIsophotes", "showCenters", "showMge",
   "mgeLoadBtn", "mgeInput", "mgePa", "mgeStatus", "mapTitle", "mapSubtitle", "mapStatus", "mapCanvas", "mapTooltip",
   "colorbarCanvas", "zoomInBtn", "zoomOutBtn", "zoomResetBtn", "binInput", "addBinBtn", "clearBinsBtn", "binChips",
   "metrics", "losvdCanvas", "losvdLegend", "losvdAll", "losvdHint", "spectrumCanvas", "spectrumStatus", "specResetBtn",
@@ -167,6 +180,10 @@ async function readSource(source) {
   const name = source.name;
   const ext = extensionOf(name);
   if (["h5", "hdf5", "hdf", "he5"].includes(ext)) return loadHdf5(source.file ? {file: source.file} : {url: source.url}, name);
+  if (["fits", "fit", "fts"].includes(ext)) {
+    const blob = source.file || await fetch(source.url).then((r) => r.blob());
+    return {results: [], settings: null, mge: null, wcs: await readFitsWcs(blob, name)};
+  }
   const text = source.file ? await source.file.text() : await fetch(source.url).then((r) => {
     if (!r.ok) throw new Error(`HTTP ${r.status} for ${source.url}`);
     return r.text();
@@ -184,15 +201,21 @@ async function readSource(source) {
 
 async function loadSources(sources) {
   let loaded = 0;
+  const pendingWcs = [];
   let firstNew = null;
   for (const source of sources) {
     try {
-      const {results, settings, mge} = await readSource(source);
+      const {results, settings, mge, wcs} = await readSource(source);
       if (mge) setMge(mge);
       if (results.length) {
         firstNew = firstNew || results[0];
         addResults(results, settings);
         loaded += results.length;
+      }
+      if (wcs) {
+        // apply after any results in the same batch have been added
+        pendingWcs.push(wcs);
+        continue;
       }
       setStatus(results.length ? `Loaded ${source.name}` : `Loaded MGE table ${source.name}`);
     } catch (error) {
@@ -204,6 +227,7 @@ async function loadSources(sources) {
   // Show the first file of a batch rather than the last one.
   if (firstNew && state.activeUid !== firstNew.uid) setActive(firstNew.uid);
   if (loaded) setStatus(`Loaded ${loaded} result${loaded === 1 ? "" : "s"}`);
+  pendingWcs.forEach(applyWcs);
 }
 
 function loadFiles(fileList) {
@@ -218,9 +242,13 @@ function addResults(results, settings) {
     r.color = RESULT_COLORS[(app.results.length + i) % RESULT_COLORS.length];
   });
   app.results.push(...results);
+  if (app.pendingWcs) {
+    results.forEach((r) => {
+      if (!r.wcs && pixelScaleMatches(r, app.pendingWcs)) r.wcs = {cd: app.pendingWcs.cd, source: app.pendingWcs.source};
+    });
+  }
   if (first && settings) {
-    if (Number.isFinite(settings.rotation)) state.rotation = settings.rotation;
-    if (Number.isFinite(settings.mgePa)) state.mgePa = settings.mgePa;
+    applySettings(settings);
   }
   el.welcome.hidden = true;
   el.workspace.hidden = false;
@@ -263,13 +291,18 @@ function compareResult() {
   return app.results.find((r) => r.uid === state.compareUid) || null;
 }
 
+// Bins are matched by position in the displayed frame, so in the sky
+// orientations results from different instruments line up.
+function matchTolerance(a, b) {
+  return 0.5 * Math.max(a.spacing, b.spacing);
+}
+
 function matchFor(a, b) {
   if (a === b) return null;
   a._matchCache = a._matchCache || new Map();
-  if (!a._matchCache.has(b.uid)) {
-    a._matchCache.set(b.uid, matchBins(a, b, 0.5 * Math.min(a.spacing, b.spacing)));
-  }
-  return a._matchCache.get(b.uid);
+  const key = `${b.uid}|${frameKey(a)}|${frameKey(b)}`;
+  if (!a._matchCache.has(key)) a._matchCache.set(key, matchBins(displayCoords(a), displayCoords(b), matchTolerance(a, b)));
+  return a._matchCache.get(key);
 }
 
 function ensureGh(r) {
@@ -456,14 +489,138 @@ function resolveLimits(values) {
 
 // ------------------------------------------------------------------ map geometry
 
+// ------------------------------------------------------------------ orientation
+
+function frameSettings() {
+  return {orientation: state.orientation, dataRotationDeg: state.dataRotation, galaxyPaDeg: state.galaxyPa, flip: state.majorFlip};
+}
+
+function frameKey(r) {
+  return `${state.orientation}|${state.dataRotation}|${state.galaxyPa}|${state.majorFlip}|${r.wcs ? r.wcs.cd.join(",") : "-"}`;
+}
+
+// Raw (x, y) -> display matrix for a result, its inverse, the orientation
+// actually used and the sky matrix W (raw -> East, North) when known.
+function frameOf(r) {
+  const key = frameKey(r);
+  if (r._frame?.key === key) return r._frame;
+  const W = r.wcs ? skyMatrix(r.wcs.cd) : null;
+  const {M, mode} = displayMatrix(frameSettings(), W);
+  r._frame = {key, M, Minv: invert(M), mode, W, Winv: W ? invert(W) : null};
+  return r._frame;
+}
+
+function displayCoords(r) {
+  const f = frameOf(r);
+  if (r._disp?.key === f.key) return r._disp;
+  const x = new Float64Array(r.nbins);
+  const y = new Float64Array(r.nbins);
+  for (let b = 0; b < r.nbins; b += 1) [x[b], y[b]] = apply(f.M, r.x[b], r.y[b]);
+  r._disp = {key: f.key, x, y};
+  return r._disp;
+}
+
+// Angle (deg, CCW from +x) of the galaxy major axis on screen, or 0 when
+// the sky orientation of the result is unknown.
+function majorAxisDisplayAngle(r) {
+  const f = frameOf(r);
+  if (!f.W || !Number.isFinite(state.galaxyPa)) return 0;
+  const t = state.galaxyPa * Math.PI / 180;
+  const [x, y] = apply(mul(f.M, f.Winv), Math.sin(t), Math.cos(t));
+  return Math.atan2(y, x) * 180 / Math.PI;
+}
+
+function pixelScaleMatches(r, wcs) {
+  const scale = r.grid && !r.grid.imageOnly ? r.grid.dx : null;
+  return Boolean(scale && Math.abs(scale - wcs.pixelScaleArcsec) / wcs.pixelScaleArcsec < 0.02);
+}
+
+// Attach a WCS read from a FITS file to the results it belongs to: every
+// result whose spaxel size matches the FITS pixel scale, or else the active one.
+function applyWcs(wcs) {
+  if (!app.results.length) {
+    app.pendingWcs = wcs;
+    setStatus(`Read the WCS of ${wcs.source}; it will be applied to results with ${formatValue(wcs.pixelScaleArcsec)}″ spaxels`);
+    return;
+  }
+  let targets = app.results.filter((r) => pixelScaleMatches(r, wcs));
+  const mismatch = !targets.length;
+  if (mismatch) targets = [activeResult()].filter(Boolean);
+  targets.forEach((r) => {
+    r.wcs = {cd: wcs.cd, source: wcs.source};
+  });
+  app.pendingWcs = wcs;
+  const names = targets.map((r) => r.label).join(", ");
+  setStatus(mismatch
+    ? `Applied the WCS of ${wcs.source} to ${names}, although its ${formatValue(wcs.pixelScaleArcsec)}″ pixels differ from the spaxel size`
+    : `Applied the WCS of ${wcs.source} to ${names}`, {error: mismatch});
+  if (state.orientation === "data") state.orientation = "sky";
+  state.zoom = null;
+  renderAll();
+}
+
+function applySettings(settings) {
+  if (!settings) return;
+  if (Number.isFinite(settings.rotation)) state.dataRotation = settings.rotation;
+  if (Number.isFinite(settings.dataRotation)) state.dataRotation = settings.dataRotation;
+  if (Number.isFinite(settings.galaxyPa)) state.galaxyPa = settings.galaxyPa;
+  if (["data", "sky", "major"].includes(settings.orientation)) state.orientation = settings.orientation;
+  if (Number.isFinite(settings.mgePa)) state.mgePa = settings.mgePa;
+  if (typeof settings.majorFlip === "boolean") state.majorFlip = settings.majorFlip;
+}
+
+function axisLabels(mode) {
+  if (mode === "sky") return {x: "ΔRA (arcsec)", y: "ΔDec (arcsec)", flipX: true};
+  if (mode === "major") return {x: "major axis (arcsec)", y: "minor axis (arcsec)", flipX: false};
+  const rotated = Math.abs(state.dataRotation) > 1e-9;
+  return {x: rotated ? "x′ (arcsec)" : "x (arcsec)", y: rotated ? "y′ (arcsec)" : "y (arcsec)", flipX: false};
+}
+
+function drawCompass(ctx, v, f, t) {
+  if (!f.W) return;
+  const toScreenDir = (e, n) => {
+    const [x, y] = apply(mul(f.M, f.Winv), e, n);
+    const len = Math.hypot(x, y) || 1;
+    return [x / len, -y / len];
+  };
+  const len = 26;
+  const ox = v.left + v.width - 46;
+  const oy = v.top + 46;
+  ctx.save();
+  ctx.strokeStyle = t.ink;
+  ctx.fillStyle = t.ink;
+  ctx.lineWidth = 1.4;
+  ctx.font = `600 11px ${t.font}`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  [["N", 0, 1], ["E", 1, 0]].forEach(([label, e, n]) => {
+    const [dx, dy] = toScreenDir(e, n);
+    const ex = ox + dx * len;
+    const ey = oy + dy * len;
+    ctx.beginPath();
+    ctx.moveTo(ox, oy);
+    ctx.lineTo(ex, ey);
+    ctx.stroke();
+    const a = Math.atan2(dy, dx);
+    ctx.beginPath();
+    ctx.moveTo(ex, ey);
+    ctx.lineTo(ex - 6 * Math.cos(a - 0.45), ey - 6 * Math.sin(a - 0.45));
+    ctx.lineTo(ex - 6 * Math.cos(a + 0.45), ey - 6 * Math.sin(a + 0.45));
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillText(label, ox + dx * (len + 9), oy + dy * (len + 9));
+  });
+  ctx.restore();
+}
+
 function displayExtent(r) {
-  const [c, s] = rotationTrig(state.rotation);
+  const {M} = frameOf(r);
   let xmin = Infinity;
   let xmax = -Infinity;
   let ymin = Infinity;
   let ymax = -Infinity;
   const add = (x, y) => {
-    const [xd, yd] = rotatePoint(x, y, c, s);
+    const [xd, yd] = apply(M, x, y);
     if (!Number.isFinite(xd) || !Number.isFinite(yd)) return;
     xmin = Math.min(xmin, xd);
     xmax = Math.max(xmax, xd);
@@ -477,7 +634,7 @@ function displayExtent(r) {
   return {xmin: xmin - pad, xmax: xmax + pad, ymin: ymin - pad, ymax: ymax + pad};
 }
 
-function computeView(width, height, bounds) {
+function computeView(width, height, bounds, frame) {
   const pad = {left: 58, right: 12, top: 12, bottom: 48};
   const pw = Math.max(50, width - pad.left - pad.right);
   const ph = Math.max(50, height - pad.top - pad.bottom);
@@ -486,16 +643,15 @@ function computeView(width, height, bounds) {
   const k = Math.min(pw / bw, ph / bh);
   const cx = (bounds.xmin + bounds.xmax) / 2;
   const cy = (bounds.ymin + bounds.ymax) / 2;
-  const [cos, sin] = rotationTrig(state.rotation);
   return {
-    left: pad.left, top: pad.top, width: pw, height: ph, k, cos, sin,
+    left: pad.left, top: pad.top, width: pw, height: ph, k, M: frame.M, Minv: frame.Minv,
     xmin: cx - pw / k / 2, xmax: cx + pw / k / 2, ymin: cy - ph / k / 2, ymax: cy + ph / k / 2
   };
 }
 
 function rawToScreen(v, x, y) {
-  const xr = x * v.cos - y * v.sin;
-  const yr = x * v.sin + y * v.cos;
+  const xr = v.M[0] * x + v.M[1] * y;
+  const yr = v.M[2] * x + v.M[3] * y;
   return [v.left + (xr - v.xmin) * v.k, v.top + (v.ymax - yr) * v.k];
 }
 
@@ -509,7 +665,7 @@ function screenToDisplay(v, sx, sy) {
 
 function screenToRaw(v, sx, sy) {
   const [xd, yd] = screenToDisplay(v, sx, sy);
-  return [xd * v.cos + yd * v.sin, -xd * v.sin + yd * v.cos];
+  return apply(v.Minv, xd, yd);
 }
 
 // ------------------------------------------------------------------ map drawing
@@ -555,7 +711,7 @@ function drawGridImage(ctx, v, dpr, grid, gridValues, lut, vmin, vmax, smooth, f
   ctx.save();
   const k = v.k;
   ctx.setTransform(
-    dpr * k * v.cos, dpr * -k * v.sin, dpr * -k * v.sin, dpr * -k * v.cos,
+    dpr * k * v.M[0], dpr * -k * v.M[2], dpr * k * v.M[1], dpr * -k * v.M[3],
     dpr * (v.left - k * v.xmin), dpr * (v.top + k * v.ymax)
   );
   ctx.transform(grid.dx, 0, 0, grid.dy, grid.x0 - grid.dx / 2, grid.y0 - grid.dy / 2);
@@ -615,9 +771,10 @@ function mgeContours(r) {
   if (!app.mge) return null;
   const e = displayExtent(r);
   const half = Math.max(Math.abs(e.xmin), Math.abs(e.xmax), Math.abs(e.ymin), Math.abs(e.ymax)) * 1.05;
-  const key = `${state.mgePa}|${half.toFixed(3)}`;
+  const angle = state.mgePa + majorAxisDisplayAngle(r);
+  const key = `${angle.toFixed(4)}|${half.toFixed(3)}`;
   if (app.mgeCache?.key === key) return app.mgeCache.contours;
-  const {grid, values} = mgeModelGrid(app.mge.gaussians, [-half, half, -half, half], state.mgePa, 260);
+  const {grid, values} = mgeModelGrid(app.mge.gaussians, [-half, half, -half, half], angle, 260);
   const contours = marchingSquares(grid, values, magnitudeLevels(values, 0.5, 14));
   app.mgeCache = {key, contours};
   return contours;
@@ -721,8 +878,9 @@ function renderMap() {
   const t = theme();
   const {ctx, width, height, dpr} = setupCanvas(el.mapCanvas);
   ctx.clearRect(0, 0, width, height);
+  const frame = frameOf(r);
   const base = displayExtent(r);
-  const v = computeView(width, height, state.zoom || base);
+  const v = computeView(width, height, state.zoom || base, frame);
   state.mapView = v;
   ctx.fillStyle = t.plotBg;
   ctx.fillRect(v.left, v.top, v.width, v.height);
@@ -749,6 +907,7 @@ function renderMap() {
   }
   drawOverlays(ctx, v, r, t);
   drawSelectionRings(ctx, v, r);
+  drawCompass(ctx, v, frame, t);
   ctx.restore();
 
   if (layer.type === "none") {
@@ -757,10 +916,12 @@ function renderMap() {
     ctx.textAlign = "center";
     ctx.fillText(`${info.name} is not available for this result`, v.left + v.width / 2, v.top + v.height / 2);
   }
-  const rotated = Math.abs(state.rotation) > 1e-9;
+  const labels = axisLabels(frame.mode);
   drawAxes(ctx, {left: v.left, top: v.top, width: v.width, height: v.height, xmin: v.xmin, xmax: v.xmax, ymin: v.ymin, ymax: v.ymax}, t, {
-    xlabel: rotated ? "x′ (arcsec)" : "x (arcsec)",
-    ylabel: rotated ? "y′ (arcsec)" : "y (arcsec)"
+    xlabel: labels.x,
+    ylabel: labels.y,
+    // East is to the left in the sky orientation: label offsets as ΔRA
+    xFormat: labels.flipX ? (val, step) => formatTick(-val, step) : null
   });
   const unit = info.unit ? (diff ? `Δ ${info.unit}` : info.unit) : (diff ? `Δ ${info.label}` : info.label);
   drawColorbar(el.colorbarCanvas, lut, vmin, vmax, unit, t, {top: v.top, bottom: height - v.top - v.height});
@@ -781,6 +942,8 @@ function renderMap() {
   if (Number.isFinite(state.minSnr)) parts.push(`S/N ≥ ${state.minSnr}`);
   if (state.zoom) parts.push(`zoom ${formatValue(v.xmax - v.xmin)}″ × ${formatValue(v.ymax - v.ymin)}″`);
   if (state.showMge && !app.mge && !r.staticOverlays.length) parts.push("load an MGE table to draw MGE contours");
+  if (state.orientation !== "data" && frame.mode === "data") parts.push(`${r.label} has no WCS, so it is shown in its data frame; load the cube's FITS file to orient it`);
+  if (state.orientation === "major" && frame.mode === "sky") parts.push("set the galaxy PA to align the major axis; showing North up");
   el.mapStatus.textContent = parts.join(" · ");
 }
 
@@ -855,6 +1018,11 @@ function updateTooltip(event) {
   let text = `Bin ${b} · ${prefix}${info.label} ${formatValue(val, info.unit)}`;
   if (state.quantity === "flux" && r.grid?.flux && state.view !== "bins") {
     text = `Bin ${b} · log flux ${formatValue(val)}`;
+  }
+  const f = frameOf(r);
+  if (f.W) {
+    const [e, n] = apply(f.W, r.x[b], r.y[b]);
+    text += ` · ΔRA ${e.toFixed(2)}″ ΔDec ${n.toFixed(2)}″`;
   }
   el.mapTooltip.textContent = text;
   el.mapTooltip.hidden = false;
@@ -966,7 +1134,7 @@ function setActive(uid, {keepSelection = true} = {}) {
   const r = activeResult();
   if (!r) return;
   if (keepSelection && prev && prev !== r) {
-    const match = matchBins(prev, r, 0.5 * Math.min(prev.spacing, r.spacing));
+    const match = matchBins(displayCoords(prev), displayCoords(r), matchTolerance(prev, r));
     const mapped = state.selected.map((b) => match[b]).filter((b) => b >= 0);
     state.active = state.active !== null && match[state.active] >= 0 ? match[state.active] : (mapped[mapped.length - 1] ?? null);
     state.selected = Array.from(new Set(mapped));
@@ -1086,7 +1254,8 @@ function losvdSeries() {
     const series = [];
     app.results.forEach((o) => {
       if (!o.losvd) return;
-      const b = o === r ? state.active : matchBins({x: [r.x[state.active]], y: [r.y[state.active]]}, o, 0.5 * Math.min(r.spacing, o.spacing))[0];
+      const d = displayCoords(r);
+      const b = o === r ? state.active : matchBins({x: [d.x[state.active]], y: [d.y[state.active]]}, displayCoords(o), matchTolerance(r, o))[0];
       if (b >= 0 && o.hasOutput[b]) series.push({r: o, b, color: o.color, label: `${o.label} (bin ${b})`, bold: o === r});
     });
     return series;
@@ -1561,7 +1730,8 @@ function syncControls() {
   el.cmapSelect.value = currentCmap();
   el.cmapReverse.checked = state.reverse;
   el.limitButtons.querySelectorAll("button").forEach((b) => b.classList.toggle("active", b.dataset.mode === state.limitsMode));
-  el.rotationInput.value = String(state.rotation);
+  el.rotationInput.value = String(state.dataRotation);
+  syncOrientationControls();
   el.maskSigma.checked = state.maskSigma;
   el.maskRadius.value = String(state.maskRadius);
   el.showIsophotes.checked = state.showIsophotes;
@@ -1575,8 +1745,35 @@ function syncControls() {
   el.mgeStatus.textContent = app.mge
     ? `${app.mge.source}: ${app.mge.gaussians.length} Gaussians`
     : (hasMge ? "Using MGE contours stored in the dashboard file." : "Columns: sigma_arcsec, q_obs, luminosity (or total_flux).");
+  el.mgePa.title = "MGE major-axis angle relative to the galaxy major axis (when the galaxy PA and WCS are known), otherwise relative to +x";
   el.losvdAll.checked = state.losvdAll;
   el.losvdAll.disabled = app.results.filter((o) => o.losvd).length < 2;
+}
+
+function syncOrientationControls() {
+  const r = activeResult();
+  const f = r ? frameOf(r) : null;
+  const hasWcs = Boolean(f?.W);
+  el.orientationButtons.querySelectorAll("button").forEach((b) => {
+    const mode = b.dataset.orientation;
+    b.classList.toggle("active", mode === state.orientation);
+    b.setAttribute("aria-pressed", String(mode === state.orientation));
+    b.disabled = mode !== "data" && !hasWcs;
+    b.title = b.disabled ? "Needs the WCS of the cube: load its FITS file" : "";
+  });
+  if (document.activeElement !== el.galaxyPa) el.galaxyPa.value = Number.isFinite(state.galaxyPa) ? String(state.galaxyPa) : "";
+  el.rotationInput.disabled = state.orientation !== "data";
+  el.majorFlip.checked = state.majorFlip;
+  el.majorFlip.disabled = state.orientation !== "major";
+  el.wcsClearBtn.hidden = !r?.wcs;
+  if (!r) return;
+  if (hasWcs) {
+    const d = describeSkyMatrix(f.W);
+    el.wcsStatus.textContent = `WCS from ${r.wcs.source}. Data +y axis at PA ${d.paY.toFixed(1)}°, +x at PA ${d.paX.toFixed(1)}°`
+      + `${d.standard ? "" : " (mirrored relative to the sky)"}.`;
+  } else {
+    el.wcsStatus.textContent = "No WCS for this result. Load the FITS cube (or any image with the same pixel grid) used for the fit; only its header is read.";
+  }
 }
 
 function syncLimitInputs() {
@@ -1661,12 +1858,16 @@ function exportCsv() {
   const r = activeResult();
   const keys = availableQuantities(r).filter((k) => r.quantities.has(k) || k.startsWith("gh_"));
   keys.forEach((k) => quantityValues(r, k));
-  const text = resultToCsv(r, state.rotation, keys.filter((k) => r.quantities.has(k)));
+  const text = resultToCsv(r, frameOf(r).M, keys.filter((k) => r.quantities.has(k)));
   download(new Blob([text], {type: "text/csv"}), `${safeName(r.label)}_maps.csv`);
 }
 
 function exportBundle() {
-  const bundle = makeBundle(app.results, {settings: {rotation: state.rotation, mgePa: state.mgePa}, mge: app.mge});
+  const settings = {
+    orientation: state.orientation, dataRotation: state.dataRotation, galaxyPa: state.galaxyPa,
+    majorFlip: state.majorFlip, mgePa: state.mgePa
+  };
+  const bundle = makeBundle(app.results, {settings, mge: app.mge});
   const text = JSON.stringify(bundle);
   download(new Blob([text], {type: "application/json"}), "bayeslosvd_viewer_session.json");
   setStatus(`Saved session bundle (${(text.length / 1e6).toFixed(1)} MB; spectra are not included)`);
@@ -1784,9 +1985,42 @@ function bindControls() {
   };
   el.vminInput.addEventListener("change", manual);
   el.vmaxInput.addEventListener("change", manual);
+  el.orientationButtons.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => {
+    state.orientation = b.dataset.orientation;
+    state.zoom = null;
+    renderAll();
+  }));
+  el.galaxyPa.addEventListener("change", () => {
+    state.galaxyPa = el.galaxyPa.value === "" ? NaN : Number(el.galaxyPa.value);
+    state.zoom = null;
+    renderAll();
+  });
+  el.majorFlip.addEventListener("change", () => {
+    state.majorFlip = el.majorFlip.checked;
+    state.zoom = null;
+    renderAll();
+  });
+  el.wcsLoadBtn.addEventListener("click", () => el.wcsInput.click());
+  el.wcsInput.addEventListener("change", async () => {
+    const file = el.wcsInput.files?.[0];
+    el.wcsInput.value = "";
+    if (!file) return;
+    try {
+      applyWcs(await readFitsWcs(file, file.name));
+    } catch (error) {
+      setStatus(error.message, {error: true});
+    }
+  });
+  el.wcsClearBtn.addEventListener("click", () => {
+    const r = activeResult();
+    if (!r) return;
+    r.wcs = null;
+    state.zoom = null;
+    renderAll();
+  });
   el.rotationInput.addEventListener("change", () => {
     const val = Number(el.rotationInput.value);
-    state.rotation = Number.isFinite(val) ? val : 0;
+    state.dataRotation = Number.isFinite(val) ? val : 0;
     state.zoom = null;
     renderAll();
   });
@@ -1884,18 +2118,19 @@ function bindControls() {
 
 async function loadDemo() {
   const base = new URL(".", window.location.href);
-  await loadSources(DEMO_FILES.map((path) => ({url: new URL(path, base).href, name: path.split("/").pop()})));
+  await loadSources(DEMO_FILES.map((path) => ({url: new URL(path, base).href + VERSION_QUERY, name: path.split("/").pop()})));
   try {
-    const text = await fetch(new URL(DEMO_MGE, base)).then((r) => (r.ok ? r.text() : Promise.reject(new Error(r.status))));
+    const text = await fetch(new URL(DEMO_MGE, base).href + VERSION_QUERY).then((r) => (r.ok ? r.text() : Promise.reject(new Error(r.status))));
     setMge(mgeFromTable(text, DEMO_MGE.split("/").pop()));
   } catch (error) {
     // optional
   }
-  state.rotation = DEMO_ROTATION;
+  applySettings(DEMO_SETTINGS);
+  state.zoom = null;
   renderAll();
 }
 
-// URL parameters: ?src=<url>&src=<url>&rotation=-18&mge=<url>&demo=1
+// URL parameters: ?src=<url>&src=<url>&rotation=-18&orientation=sky|major|data&pa=90&mge=<url>&demo=1
 async function loadFromQuery() {
   const params = new URLSearchParams(window.location.search);
   if (params.get("demo")) {
@@ -1912,12 +2147,14 @@ async function loadFromQuery() {
       setStatus(`Could not load MGE table: ${error.message}`, {error: true});
     }
   }
-  if (params.has("rotation")) {
-    const rot = Number(params.get("rotation"));
-    if (Number.isFinite(rot)) {
-      state.rotation = rot;
-      renderAll();
-    }
+  const settings = {};
+  if (params.has("rotation")) settings.dataRotation = Number(params.get("rotation"));
+  if (params.has("pa")) settings.galaxyPa = Number(params.get("pa"));
+  if (params.has("orientation")) settings.orientation = params.get("orientation");
+  if (Object.keys(settings).length) {
+    applySettings(settings);
+    state.zoom = null;
+    renderAll();
   }
 }
 

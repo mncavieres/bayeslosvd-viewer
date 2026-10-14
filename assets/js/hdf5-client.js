@@ -2,7 +2,8 @@
 
 export class Hdf5Client {
   constructor() {
-    this.worker = new Worker(new URL("./hdf5-worker.js", import.meta.url));
+    // carry the cache-busting ?v= query of this module over to the worker script
+    this.worker = new Worker(new URL(`./hdf5-worker.js${new URL(import.meta.url).search}`, import.meta.url));
     this.pending = new Map();
     this.nextId = 1;
     this.worker.onmessage = (event) => this.onMessage(event.data);

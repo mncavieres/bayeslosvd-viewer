@@ -18,13 +18,14 @@
 </head>
 <body>
 <h1>bayeslosvd-viewer tests</h1>
-<p class="muted">Loads the demo HDF5 files through the real worker and compares against <code>reference.json</code> (NumPy / SciPy).</p>
+<p class="muted">Loads the synthetic HDF5 files in <code>tests/data/</code> through the real worker and compares against <code>reference.json</code> (NumPy / SciPy).</p>
 <p id="summary">Running…</p>
 <ul id="log"></ul>
 <script type="module">
 import {fitGaussHermite, limitsFor, marchingSquares, matchBins, buildSpaxelGrid} from "../assets/js/analysis.js";
 import {Hdf5Client} from "../assets/js/hdf5-client.js";
 import {resultFromHdf5Summary, makeBundle, resultsFromBundle, resultFromTable, mgeFromTable} from "../assets/js/data.js";
+import {apply, displayMatrix, readFitsWcs, skyMatrix} from "../assets/js/frames.js";
 
 const log = document.getElementById("log");
 let passed = 0;
@@ -40,10 +41,37 @@ function check(name, ok, detail = "") {
 const close = (a, b, tol) => Math.abs(a - b) <= tol;
 
 async function run() {
-  const reference = await fetch("reference.json").then((r) => r.json());
+  const reference = await fetch("reference.json", {cache: "no-cache"}).then((r) => r.json());
   const client = new Hdf5Client();
+  // FITS WCS headers (PC matrix, CD in an extension, legacy CROTA2) against astropy
+  for (const [name, ref] of Object.entries(reference.wcs)) {
+    const blob = await fetch(`data/${name}`, {cache: "no-cache"}).then((r) => r.blob());
+    const wcs = await readFitsWcs(blob, name);
+    const ok = wcs.cd.every((v, i) => close(v, ref.cd[i], 1e-12));
+    check(`WCS ${name}`, ok, `${wcs.cd.map((v) => v.toExponential(4)).join(", ")}`);
+  }
+  // Orientation transforms with the NIRSpec-like WCS (+x at PA 72.3°, +y at PA 162.3°)
+  const W = skyMatrix(reference.wcs["wcs_pc.fits"].cd);
+  const [e, n] = apply(W, 1, 0);
+  check("data +x points to PA 72.3°", close(Math.atan2(e, n) * 180 / Math.PI, 72.3, 0.05));
+  const sky = displayMatrix({orientation: "sky"}, W).M;
+  const [sxN, syN] = apply(sky, ...apply([W[3], -W[1], -W[2], W[0]].map((v) => v / (W[0] * W[3] - W[1] * W[2])), 0, 1));
+  check("sky orientation: North is up", close(sxN, 0, 1e-9) && close(syN, 1, 1e-9), `${sxN.toFixed(3)}, ${syN.toFixed(3)}`);
+  const pa = 90.3;
+  const major = displayMatrix({orientation: "major", galaxyPaDeg: pa}, W).M;
+  const along = [Math.cos(18 * Math.PI / 180), Math.sin(18 * Math.PI / 180)]; // major axis in the data frame
+  const [mx, my] = apply(major, ...along);
+  check("major-axis orientation puts the major axis on x", Math.abs(mx) > 0.999 && Math.abs(my) < 0.01, `${mx.toFixed(4)}, ${my.toFixed(4)}`);
+  const winv = [W[3], -W[1], -W[2], W[0]].map((v) => v / (W[0] * W[3] - W[1] * W[2]));
+  const [, nyMajor] = apply(major, ...apply(winv, 0, 1));
+  const flipped = displayMatrix({orientation: "major", galaxyPaDeg: pa, flip: true}, W).M;
+  const [, nyFlip] = apply(flipped, ...apply(winv, 0, 1));
+  check("major-axis orientation keeps North up unless flipped", nyMajor > 0.99 && nyFlip < -0.99, `${nyMajor.toFixed(3)} / ${nyFlip.toFixed(3)}`);
+  check("sky and major orientations are proper rotations", sky[0] * sky[3] - sky[1] * sky[2] > 0 && major[0] * major[3] - major[1] * major[2] > 0);
+
   for (const [name, ref] of Object.entries(reference)) {
-    const {id, summary} = await client.open({url: new URL(`../demo/${name}`, location.href).href});
+    if (name === "wcs") continue;
+    const {id, summary} = await client.open({url: new URL(`data/${name}`, location.href).href});
     const r = resultFromHdf5Summary(summary, {fileId: id, fileName: name});
     check(`${name}: nbins`, r.nbins === ref.nbins, `${r.nbins}`);
     for (const row of ref.bins) {

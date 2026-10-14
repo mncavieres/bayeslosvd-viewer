@@ -5,7 +5,13 @@ Open one or more `*_results.hdf5` files and explore kinematic maps, line-of-sigh
 (LOSVDs), and spectral fits, with no installation, no server and no upload. Files are read locally in
 your browser with [h5wasm](https://github.com/usnistgov/h5wasm).
 
-**Live app:** https://mncavieres.github.io/bayeslosvd-viewer/ (append `?demo=1` to load synthetic demo data)
+**Live app:** https://mncavieres.github.io/bayeslosvd-viewer/ ·
+**[Open the Sombrero demo](https://mncavieres.github.io/bayeslosvd-viewer/?demo=1)**
+
+The demo opens in the major-axis orientation (PA 90°); switch to *Sky* or *Data* in the sidebar. It loads BAYES-LOSVD fits to the JWST/NIRSpec G235H IFU cube of the Sombrero galaxy (M104), with
+the AGN contribution subtracted: a MAP fit without regularization (`GaussianMAP`) and one with
+random-walk regularization (`RWregularizedMAP`), plus the galaxy's MGE model. Use *Compare with* to see
+how regularization changes the maps.
 
 ## Features
 
@@ -21,7 +27,10 @@ your browser with [h5wasm](https://github.com/usnistgov/h5wasm).
 - **Spectral fit panel.** Observed spectrum, median best fit (with band), residuals, pixels excluded
   from the fit shaded, and χ²/N. Scroll to zoom, drag to pan.
 - **Comparison.** Difference maps between any two results (bins matched by position).
-- **Display controls.** Rotation of the map frame, colormaps (incl. *sauron*), robust / min–max /
+- **Sky orientation.** Switch between the data frame (pixel axes, optionally rotated), the sky
+  (North up, East left, ΔRA/ΔDec axes, compass) and a major-axis frame (galaxy PA horizontal),
+  using the WCS of the cube. Results from different instruments share one sky frame.
+- **Display controls.** Colormaps (incl. *sauron*), robust / min–max /
   symmetric / manual colour limits, σ-outlier and S/N masks, flux isophotes, MGE contour overlays.
 - **Export.** PNG of the map, CSV of all maps for a result, and a compact JSON *session bundle*
   (≈1–2 MB even for large MUSE runs) that anyone can reopen in the viewer.
@@ -53,8 +62,10 @@ python3 -m http.server 8000
 |---|---|---|
 | `src` (repeatable) | `?src=https://example.org/run_results.hdf5` | Load files from URLs (HDF5, JSON bundle, HTML dashboard, CSV). The host must allow CORS. |
 | `mge` | `?mge=https://example.org/mge.csv` | Load an MGE table. |
-| `rotation` | `?rotation=-18` | Rotate the map frame (degrees, counter-clockwise). |
-| `demo` | `?demo=1` | Load the synthetic demo data. |
+| `orientation` | `?orientation=sky` | `data`, `sky` (North up, East left) or `major` (major axis horizontal). |
+| `pa` | `?pa=90` | Galaxy major-axis PA (degrees East of North), used by `orientation=major`. |
+| `rotation` | `?rotation=-18` | Rotation of the data orientation (degrees, counter-clockwise). |
+| `demo` | `?demo=1` | Load the Sombrero NIRSpec demo. |
 
 `src` is handy for sharing: put a session bundle (`.json`) in a public place (a GitHub repo, Zenodo)
 and send a link such as `https://mncavieres.github.io/bayeslosvd-viewer/?src=<raw-url-of-bundle>`.
@@ -66,6 +77,7 @@ and send a link such as `https://mncavieres.github.io/bayeslosvd-viewer/?src=<ra
 | `.hdf5`, `.h5` | BAYES-LOSVD results (see below). |
 | `.json` | Session bundles exported by this viewer, or the `DATA` payload of a legacy dashboard. |
 | `.html` | Legacy dashboards from `build_kinematics_dashboard.py` (the embedded `const DATA = …`). |
+| `.fits` | The cube used for the fit (or any image on the same pixel grid). Only the header is read, for the sky orientation (see below). |
 | `.csv`, `.txt` | Bin tables: `x`, `y` (arcsec) plus any numeric columns, each becoming a map (`vel`, `sigma`, `h3`, `h4`, `snr` are recognised). Or MGE tables: `sigma_arcsec`, `q_obs` and `luminosity_Lsun` / `total_flux` (or `surf`). |
 
 ### Expected HDF5 layout
@@ -86,9 +98,39 @@ out/<bin>/losvd           (5, nvel) percentiles 0.1, 15.9, 50, 84.1, 99.9 (MAP r
 out/<bin>/bestfit         (5, npix_obs) best-fit model percentiles
 out/<bin>/vel, sigma, h1…h6   model parameters (parametric fits), shown as "Model parameters"
 attributes fit_type, fit_mode, regularization   shown in the result list and details
+attributes WCS_CD1_1 … WCS_CD2_2, WCS_SOURCE      optional sky orientation (see below)
 ```
 
 Partial runs (only some bins in `out/`) are fine; missing bins are shown as empty.
+
+## Orientation
+
+BAYES-LOSVD's instrument readers define `x = (column − c0)·pixel` and `y = (row − r0)·pixel`, offsets
+along the cube's pixel axes from the brightest spaxel. The cube's spatial WCS matrix therefore maps
+(x, y) onto the sky, and the viewer offers three orientations:
+
+| Orientation | Axes | Needs |
+|---|---|---|
+| **Data** | x, y as stored, optionally rotated by *Data rotation* | — |
+| **Sky** | ΔRA (increasing to the left, East) and ΔDec (North up) | WCS |
+| **Major axis** | the galaxy major axis along +x′, keeping North in the upper half (tick *Flip* for the other end) | WCS and galaxy PA |
+
+The WCS can come from
+
+- **the FITS file of the cube**, dropped on the page or loaded with *Load WCS from FITS* (only the
+  header is read). It is applied to every loaded result whose spaxel size matches the FITS pixel scale;
+- **attributes in the results file**, written once with
+
+  ```bash
+  python tools/add_wcs.py run_results.hdf5 cube.fits    # needs h5py, astropy
+  ```
+
+  or while slimming with `tools/slim_results.py … --wcs-fits cube.fits`.
+
+In the Sky and Major-axis orientations, results from different instruments are drawn in the same frame
+and matched by sky position (difference maps, *Same bin in all results*). Each result is still centred on
+its own brightest spaxel, so this assumes those coincide on the sky. The MGE overlay follows the galaxy
+major axis; its *Angle* is measured from that axis.
 
 ## Definitions
 
@@ -101,11 +143,21 @@ Partial runs (only some bins in `out/`) are fine; missing bins are shown as empt
   characterisation, not BAYES-LOSVD's own Bayesian GH fit (`bayes_losvd_ghfit.py`).
 - **σ outliers.** Bins whose σ exceeds the largest σ found within a chosen radius of the centre
   (default 1″), as in the original dashboards.
-- **Rotation.** Bin and spaxel coordinates are rotated counter-clockwise by the given angle
-  (x′ = x cos θ − y sin θ, y′ = x sin θ + y cos θ). Use it to align the major axis with x′.
-- **MGE overlay.** Contours of the MGE surface brightness, centred on (0, 0), with the major axis at the
-  given PA measured counter-clockwise from +x′ in the displayed (rotated) frame.
+- **Data rotation.** In the Data orientation, coordinates are rotated counter-clockwise by the given
+  angle (x′ = x cos θ − y sin θ, y′ = x sin θ + y cos θ).
+- **MGE overlay.** Contours of the MGE surface brightness centred on (0, 0). Their major axis lies along
+  the galaxy major axis plus *Angle* when the galaxy PA and WCS are known, otherwise at *Angle* from +x.
 - **Isophotes and MGE contours** are drawn every 0.5 mag below the peak.
+
+## Sharing results files
+
+BAYES-LOSVD results contain arrays the viewer never reads (templates, convolved spectra) and, for MAP
+runs, five identical percentile rows per bin. `tools/slim_results.py` writes a compact copy (typically
+6–7× smaller) that is easy to host or send, and drops attributes containing local file paths:
+
+```bash
+python tools/slim_results.py run_results.hdf5 run_slim_results.hdf5   # needs numpy, h5py
+```
 
 ## Session bundles
 
@@ -121,20 +173,21 @@ index.html              page shell
 assets/css/app.css      styles (light/dark themes)
 assets/js/main.js       state, UI, map/LOSVD/spectrum rendering, interaction
 assets/js/data.js       input formats -> common result model; bundles; CSV export
+assets/js/frames.js     FITS header WCS reader and orientation matrices
 assets/js/analysis.js   moments, Gauss–Hermite fits, statistics, grids, contours, MGE
 assets/js/hdf5-worker.js  Web Worker that reads HDF5 with h5wasm (WORKERFS for local files)
 assets/js/colormaps.js  colormap lookup tables
 assets/js/plot.js       canvas axes, ticks and colorbars
-demo/                   synthetic BAYES-LOSVD files (tools/make_demo_data.py)
-tests/                  browser test page + reference values (tools/make_reference.py)
+demo/                   Sombrero NIRSpec demo (slimmed results + MGE table)
+tests/                  browser test page, synthetic data (tests/data) and reference values
 ```
 
 External code is loaded from jsDelivr at pinned versions: `h5wasm@0.10.3` (HDF5 reader, loaded by the
 worker) and `delaunator@5.0.1` (triangulation for interpolated maps).
 
-**Tests.** Serve the repository and open `/tests/`. The page loads the demo files through the real
+**Tests.** Serve the repository and open `/tests/`. The page loads the synthetic files in `tests/data/` through the real
 worker and compares moments and Gauss–Hermite fits against NumPy/SciPy values in
-`tests/reference.json`. To regenerate the demo data and the reference values:
+`tests/reference.json`. To regenerate the synthetic data and the reference values:
 
 ```bash
 python tools/make_demo_data.py      # needs numpy, h5py
@@ -142,7 +195,8 @@ python tools/make_reference.py      # needs numpy, h5py, scipy
 ```
 
 **Deployment.** `.github/workflows/pages.yml` publishes the repository to GitHub Pages on every push
-to `main`. In the repository settings, set *Pages → Source* to *GitHub Actions*.
+to `main`. It replaces `__VERSION__` in `index.html` with the commit hash, so browsers fetch a
+consistent set of modules after each update instead of mixing cached ones. In the repository settings, set *Pages → Source* to *GitHub Actions*.
 
 ## Citation
 

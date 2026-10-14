@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write small synthetic BAYES-LOSVD results files for the viewer demo.
+"""Write small synthetic BAYES-LOSVD results files used by the browser tests.
 
 The files follow the layout written by BAYES-LOSVD's ``bayes_losvd_run.py``:
 
@@ -210,7 +210,7 @@ def write_mge(path):
 
 
 def main():
-    out_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent / "demo"
+    out_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent / "tests" / "data"
     out_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(20261014)
     n1 = write_file(out_dir / "demo_disk_sampling_results.hdf5", sampling=True, rng=rng)

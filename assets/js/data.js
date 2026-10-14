@@ -13,9 +13,11 @@
 //   grid                         spaxel lattice {nx, ny, x0, y0, dx, dy, bin, flux} or null
 //   staticOverlays               [{name, frame:"raw", contours}] from legacy dashboards
 //   spectra                      {fileId} when spectra can be fetched from the worker
+//   wcs                          {cd: [CD1_1, CD1_2, CD2_1, CD2_2] (deg/pix, rows East, North), source} or null
 // }
 
 import {buildSpaxelGrid, losvdMoments, medianSpacing, rotatePoint, rotationTrig, sortVelocityAxis, trapz} from "./analysis.js";
+import {apply, skyMatrix} from "./frames.js";
 
 export const BUNDLE_FORMAT = "bayeslosvd-viewer-bundle";
 export const PERCENTILES = [0.1, 15.9, 50.0, 84.1, 99.9];
@@ -133,7 +135,8 @@ function baseResult(fields) {
     grid: fields.grid || null,
     staticOverlays: fields.staticOverlays || [],
     spectra: fields.spectra || null,
-    notes: fields.notes || []
+    notes: fields.notes || [],
+    wcs: fields.wcs || null
   };
   result.regularized = isRegularized(result.regularization, result.fitType, result.label, result.attrs.model_code);
   result.r = Float64Array.from(result.x, (xv, i) => Math.hypot(xv, result.y[i]));
@@ -159,6 +162,19 @@ function addCommonQuantities(result) {
 }
 
 // ---------------------------------------------------------------- HDF5
+
+// Optional sky orientation stored as root attributes WCS_CD1_1 ... WCS_CD2_2
+// (the spatial CD matrix of the cube, deg/pixel; see tools/add_wcs.py).
+function wcsFromAttrs(attrs, fileName) {
+  const get = (k) => {
+    const key = Object.keys(attrs).find((a) => a.toUpperCase() === k);
+    return key === undefined ? NaN : Number(attrs[key]);
+  };
+  const cd = ["WCS_CD1_1", "WCS_CD1_2", "WCS_CD2_1", "WCS_CD2_2"].map(get);
+  if (!cd.every(Number.isFinite) || cd[0] * cd[3] - cd[1] * cd[2] === 0) return null;
+  const src = Object.keys(attrs).find((a) => a.toUpperCase() === "WCS_SOURCE");
+  return {cd, source: src ? `${attrs[src]} (via ${fileName})` : `attributes of ${fileName}`};
+}
 
 const PARAM_QUANTITIES = {
   vel: "fit_vel", sigma: "fit_sigma", h1: "fit_h1", h2: "fit_h2", h3: "fit_h3", h4: "fit_h4", h5: "fit_h5", h6: "fit_h6"
@@ -187,7 +203,8 @@ export function resultFromHdf5Summary(summary, {fileId, fileName, label}) {
     binFlux: s.binFlux && s.binFlux.length === nbins ? s.binFlux : null,
     hasOutput: s.hasOutput,
     grid,
-    spectra: s.hasSpectra ? {fileId} : null
+    spectra: s.hasSpectra ? {fileId} : null,
+    wcs: wcsFromAttrs(attrs, fileName)
   });
   finalizeLosvd(result, s.xvel, s.losvd, s.rows);
 
@@ -493,6 +510,7 @@ export function makeBundle(results, {settings, mge}) {
         losvd,
         quantities,
         paramErrors: Object.fromEntries(Array.from(r.paramErrors, ([k, v]) => [k, {lo: round(v.lo), hi: round(v.hi)}])),
+        wcs: r.wcs,
         grid: r.grid ? {
           nx: r.grid.nx,
           ny: r.grid.ny,
@@ -534,7 +552,8 @@ export function resultsFromBundle(bundle, fileName) {
       binFlux: toFloatArray(r.binFlux, n),
       hasOutput: Uint8Array.from(r.hasOutput || new Array(n).fill(1)),
       grid,
-      notes: [...(r.notes || []), `loaded from bundle ${fileName}`]
+      notes: [...(r.notes || []), `loaded from bundle ${fileName}`],
+      wcs: r.wcs && Array.isArray(r.wcs.cd) ? r.wcs : null
     });
     // Bundles store an already sorted axis; finalizeLosvd re-sorts (no-op) and renormalizes.
     finalizeLosvd(result, r.xvel ? toFloatArray(r.xvel) : null, r.losvd ? toFloatArray(r.losvd) : null, r.rows || 1);
@@ -554,17 +573,21 @@ export function resultsFromBundle(bundle, fileName) {
 
 // ---------------------------------------------------------------- exports
 
-export function resultToCsv(result, rotationDeg, quantityKeys) {
-  const [c, s] = rotationTrig(rotationDeg);
-  const header = ["bin", "x_arcsec", "y_arcsec", "x_display", "y_display", "has_output", ...quantityKeys];
+// displayMatrix: raw (x, y) -> displayed frame (2x2, row-major).
+export function resultToCsv(result, displayMatrix, quantityKeys) {
+  const M = displayMatrix || [1, 0, 0, 1];
+  const W = result.wcs ? skyMatrix(result.wcs.cd) : null;
+  const sky = W ? ["dRA_arcsec", "dDec_arcsec"] : [];
+  const header = ["bin", "x_arcsec", "y_arcsec", "x_display", "y_display", ...sky, "has_output", ...quantityKeys];
   const lines = [header.join(",")];
   for (let b = 0; b < result.nbins; b += 1) {
-    const [xd, yd] = rotatePoint(result.x[b], result.y[b], c, s);
+    const [xd, yd] = apply(M, result.x[b], result.y[b]);
+    const skyCols = W ? apply(W, result.x[b], result.y[b]).map((v) => v.toFixed(6)) : [];
     const vals = quantityKeys.map((k) => {
       const v = result.quantities.get(k)?.[b];
       return Number.isFinite(v) ? Number(v.toPrecision(8)) : "";
     });
-    lines.push([b, result.x[b], result.y[b], xd.toFixed(6), yd.toFixed(6), result.hasOutput[b], ...vals].join(","));
+    lines.push([b, result.x[b], result.y[b], xd.toFixed(6), yd.toFixed(6), ...skyCols, result.hasOutput[b], ...vals].join(","));
   }
   return `${lines.join("\n")}\n`;
 }

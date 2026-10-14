@@ -6,14 +6,28 @@
 <title>BAYES-LOSVD Viewer</title>
 <meta name="description" content="Interactive viewer for BAYES-LOSVD results: kinematic maps, LOSVDs and spectral fits, read from HDF5 directly in the browser.">
 <link rel="icon" href="assets/icon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="assets/css/app.css">
+<link rel="stylesheet" href="assets/css/app.css?v=__VERSION__">
 <script>
   try {
     const t = localStorage.getItem("bayeslosvd-viewer-theme");
     if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
   } catch (e) {}
 </script>
-<script type="module" src="assets/js/main.js"></script>
+<!-- __VERSION__ is replaced by the commit hash on deploy so browsers never mix cached modules -->
+<script type="importmap">
+{
+  "imports": {
+    "./assets/js/analysis.js": "./assets/js/analysis.js?v=__VERSION__",
+    "./assets/js/colormaps.js": "./assets/js/colormaps.js?v=__VERSION__",
+    "./assets/js/data.js": "./assets/js/data.js?v=__VERSION__",
+    "./assets/js/frames.js": "./assets/js/frames.js?v=__VERSION__",
+    "./assets/js/hdf5-client.js": "./assets/js/hdf5-client.js?v=__VERSION__",
+    "./assets/js/main.js": "./assets/js/main.js?v=__VERSION__",
+    "./assets/js/plot.js": "./assets/js/plot.js?v=__VERSION__"
+  }
+}
+</script>
+<script type="module" src="assets/js/main.js?v=__VERSION__"></script>
 </head>
 <body>
 <header class="topbar">
@@ -30,7 +44,7 @@
   </div>
   <div class="topbar-actions">
     <button type="button" class="btn primary" id="openBtn">Open files</button>
-    <input type="file" id="fileInput" multiple hidden accept=".h5,.hdf5,.hdf,.he5,.json,.csv,.txt,.dat,.html,.htm">
+    <input type="file" id="fileInput" multiple hidden accept=".h5,.hdf5,.hdf,.he5,.json,.csv,.txt,.dat,.html,.htm,.fits,.fit,.fts">
     <div class="menu" id="exportMenu">
       <button type="button" class="btn" id="exportBtn" aria-haspopup="true" aria-expanded="false">Export</button>
       <div class="menu-list" hidden>
@@ -59,8 +73,9 @@
     <p>Drop one or more <code>*_results.hdf5</code> files anywhere on this page. Files are read locally in your browser; nothing is uploaded.</p>
     <div class="welcome-actions">
       <button type="button" class="btn primary large" id="welcomeOpenBtn">Choose files</button>
-      <button type="button" class="btn large" id="demoBtn">Load demo data</button>
+      <button type="button" class="btn large" id="demoBtn">Load Sombrero demo</button>
     </div>
+    <p class="demo-note">The demo shows BAYES-LOSVD fits to the JWST/NIRSpec G235H IFU cube of the Sombrero galaxy (M104), without and with random-walk regularization.</p>
     <dl class="formats">
       <dt>.hdf5 / .h5</dt>
       <dd>BAYES-LOSVD results (output of <code>bayes_losvd_run.py</code>): moment maps, LOSVDs with credible bands, and spectral fits.</dd>
@@ -68,6 +83,8 @@
       <dd>Session bundles exported from this viewer, or the data payload of a legacy dashboard.</dd>
       <dt>.html</dt>
       <dd>Self-contained dashboards made by <code>build_kinematics_dashboard.py</code>.</dd>
+      <dt>.fits</dt>
+      <dd>The cube (or an image on the same pixel grid) used for the fit: its WCS orients the maps on the sky. Only the header is read.</dd>
       <dt>.csv</dt>
       <dd>Bin tables (<code>x</code>, <code>y</code> and any columns to map), or MGE tables (<code>sigma_arcsec</code>, <code>q_obs</code>, luminosity) for contour overlays.</dd>
     </dl>
@@ -123,10 +140,32 @@
           <button type="button" data-mode="symmetric">± Symmetric</button>
         </div>
       </div>
-      <label class="field">
-        <span class="field-label">Rotate map (degrees, counter-clockwise)</span>
-        <input type="number" id="rotationInput" step="any" value="0">
-      </label>
+    </section>
+
+    <section class="card">
+      <h2>Orientation</h2>
+      <div class="segmented" id="orientationButtons">
+        <button type="button" data-orientation="data" title="Pixel axes of the data cube">Data</button>
+        <button type="button" data-orientation="sky">Sky (N↑ E←)</button>
+        <button type="button" data-orientation="major">Major axis →</button>
+      </div>
+      <div class="field row">
+        <label class="grow">
+          <span class="field-label">Galaxy PA (° E of N)</span>
+          <input type="number" id="galaxyPa" step="any" placeholder="e.g. 90">
+        </label>
+        <label class="grow">
+          <span class="field-label">Data rotation (° CCW)</span>
+          <input type="number" id="rotationInput" step="any" value="0">
+        </label>
+      </div>
+      <label class="check small"><input type="checkbox" id="majorFlip"> Flip major axis 180° (North down)</label>
+      <p class="hint" id="wcsStatus"></p>
+      <div class="mge-row">
+        <button type="button" class="btn small" id="wcsLoadBtn">Load WCS from FITS</button>
+        <input type="file" id="wcsInput" hidden accept=".fits,.fit,.fts">
+        <button type="button" class="btn small ghost" id="wcsClearBtn" hidden>Clear WCS</button>
+      </div>
     </section>
 
     <section class="card">
@@ -148,7 +187,7 @@
       <div class="mge-row">
         <button type="button" class="btn small" id="mgeLoadBtn">Load MGE table</button>
         <input type="file" id="mgeInput" hidden accept=".csv,.txt,.dat">
-        <label class="inline">PA <input type="number" id="mgePa" step="any" value="0" aria-label="MGE major axis angle in degrees"> °</label>
+        <label class="inline">Angle <input type="number" id="mgePa" step="any" value="0" aria-label="MGE major-axis angle relative to the galaxy major axis, degrees"> °</label>
       </div>
       <p class="hint" id="mgeStatus"></p>
     </section>
